@@ -100,12 +100,12 @@ exec(char *path, char **argv)
   curproc->tf->eip = elf.entry;  // main
   curproc->tf->esp = sp;
   switchuvm(curproc);
-  freevm(oldpgdir);
+  freevm(curproc, oldpgdir);
   return 0;
 
  bad:
   if(pgdir)
-    freevm(pgdir);
+    freevm(0, pgdir);
   if(ip){
     iunlockput(ip);
     end_op();

@@ -79,6 +79,28 @@ mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
   return 0;
 }
 
+static int
+mappages_swap(pde_t *pgdir, void *va, uint size, uint pa, int perm)
+{
+  char *a, *last;
+  pte_t *pte;
+
+  a = (char*)PGROUNDDOWN((uint)va);
+  last = (char*)PGROUNDDOWN(((uint)va) + size - 1);
+  for(;;){
+    if((pte = walkpgdir(pgdir, a, 1)) == 0)
+      return -1;
+    if(*pte & PTE_P)
+      panic("remap");
+    *pte = pa | perm;
+    if(a == last)
+      break;
+    a += PGSIZE;
+    pa += PGSIZE;
+  }
+  return 0;
+}
+
 // There is one page table per process, plus one that's used when
 // a CPU is not running any process (kpgdir). The kernel uses the
 // current process's page table during system calls and interrupts;
@@ -129,7 +151,7 @@ setupkvm(void)
   for(k = kmap; k < &kmap[NELEM(kmap)]; k++)
     if(mappages(pgdir, k->virt, k->phys_end - k->phys_start,
                 (uint)k->phys_start, k->perm) < 0) {
-      freevm(pgdir);
+      freevm(0, pgdir);
       return 0;
     }
   return pgdir;
@@ -180,16 +202,20 @@ switchuvm(struct proc *p)
 // Load the initcode into address 0 of pgdir.
 // sz must be less than a page.
 void
-inituvm(pde_t *pgdir, char *init, uint sz)
+inituvm(pde_t *pgdir, char *init, uint sz, struct proc* p)
 {
   char *mem;
 
   if(sz >= PGSIZE)
     panic("inituvm: more than a page");
+  cprintf("inituvm : ");
   mem = kalloc();
+  rmap_incref(V2P(mem), p);
+  // cprintf("inituvm: allocating page %x to process id %d", V2P(mem), myproc()->pid);
   memset(mem, 0, PGSIZE);
   mappages(pgdir, 0, PGSIZE, V2P(mem), PTE_W|PTE_U);
   memmove(mem, init, sz);
+  // rmap_incref(V2P(mem), myproc());
 }
 
 // Load a program segment into pgdir.  addr must be page-aligned
@@ -206,6 +232,7 @@ loaduvm(pde_t *pgdir, char *addr, struct inode *ip, uint offset, uint sz)
     if((pte = walkpgdir(pgdir, addr+i, 0)) == 0)
       panic("loaduvm: address should exist");
     pa = PTE_ADDR(*pte);
+    // if(PRINT) cprintf("Loaded page %x\n", pa);
     if(sz - i < PGSIZE)
       n = sz - i;
     else
@@ -231,19 +258,22 @@ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
 
   a = PGROUNDUP(oldsz);
   for(; a < newsz; a += PGSIZE){
+    myproc()->sz = a;
     mem = kalloc();
+    myproc()->rss += PGSIZE;
     if(mem == 0){
       cprintf("allocuvm out of memory\n");
-      deallocuvm(pgdir, newsz, oldsz);
+      deallocuvm(myproc(), pgdir, newsz, oldsz, 1);
       return 0;
     }
     memset(mem, 0, PGSIZE);
     if(mappages(pgdir, (char*)a, PGSIZE, V2P(mem), PTE_W|PTE_U) < 0){
       cprintf("allocuvm out of memory (2)\n");
-      deallocuvm(pgdir, newsz, oldsz);
+      deallocuvm(myproc(), pgdir, newsz, oldsz, 1);
       kfree(mem);
       return 0;
     }
+    rmap_incref(V2P(mem), myproc());
   }
   return newsz;
 }
@@ -253,7 +283,7 @@ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
 // need to be less than oldsz.  oldsz can be larger than the actual
 // process size.  Returns the new process size.
 int
-deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+deallocuvm(struct proc* p, pde_t *pgdir, uint oldsz, uint newsz, int flag)
 {
   pte_t *pte;
   uint a, pa;
@@ -267,12 +297,20 @@ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
     if(!pte)
       a = PGADDR(PDX(a) + 1, 0, 0) - PGSIZE;
     else if((*pte & PTE_P) != 0){
-      pa = PTE_ADDR(*pte);
+      pa = PTE_ADDR(*pte);    // pa is a physical address
       if(pa == 0)
         panic("kfree");
       char *v = P2V(pa);
-      kfree(v);
+      if(PRINT) cprintf("DECREF 4");
+      if(PRINT) cprintf("rmap_get_refcount(pa): %d\n", rmap_get_refcount(pa));
+      rmap_decref(pa, p);
       *pte = 0;
+      if(rmap_get_refcount(pa) == 0){
+        kfree(v);
+      }
+      if(flag == 1){
+        myproc()->rss -= PGSIZE;
+      }
     }
   }
   return newsz;
@@ -281,13 +319,32 @@ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
 // Free a page table and all the physical memory pages
 // in the user part.
 void
-freevm(pde_t *pgdir)
+freevm(struct proc* p, pde_t *pgdir)
 {
+  if(PRINT) cprintf("freeing pages of proc id %d\n", p->pid);
   uint i;
 
   if(pgdir == 0)
     panic("freevm: no pgdir");
-  deallocuvm(pgdir, KERNBASE, 0);
+  deallocuvm(p, pgdir, KERNBASE, 0, 1);
+  for(i = 0; i < NPDENTRIES; i++){
+    if(pgdir[i] & PTE_P){
+      char * v = P2V(PTE_ADDR(pgdir[i]));
+      kfree(v);
+    }
+  }
+  kfree((char*)pgdir);
+}
+
+void
+freevm_no_rss(struct proc* p, pde_t *pgdir)
+{
+  if(PRINT) cprintf("freeing pages of proc id %d\n", p->pid);
+  uint i;
+
+  if(pgdir == 0)
+    panic("freevm: no pgdir");
+  deallocuvm(p, pgdir, KERNBASE, 0, 0);
   for(i = 0; i < NPDENTRIES; i++){
     if(pgdir[i] & PTE_P){
       char * v = P2V(PTE_ADDR(pgdir[i]));
@@ -313,35 +370,58 @@ clearpteu(pde_t *pgdir, char *uva)
 // Given a parent process's page table, create a copy
 // of it for a child.
 pde_t*
-copyuvm(pde_t *pgdir, uint sz)
+copyuvm(struct proc* p, pde_t *pgdir, uint sz)
 {
   pde_t *d;
   pte_t *pte;
   uint pa, i, flags;
-  char *mem;
 
   if((d = setupkvm()) == 0)
     return 0;
   for(i = 0; i < sz; i += PGSIZE){
+    p->rss += PGSIZE;
     if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
       panic("copyuvm: pte should exist");
-    if(!(*pte & PTE_P))
-      panic("copyuvm: page not present");
-    pa = PTE_ADDR(*pte);
+
+
+    pa = PTE_ADDR(*pte);      // pa is a physical address
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto bad;
-    memmove(mem, (char*)P2V(pa), PGSIZE);
-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
-      kfree(mem);
-      goto bad;
+    flags = flags & ~PTE_W;
+    *pte = *pte & ~PTE_W; // set PTE_W to 0
+    // if(PRINT) cprintf("copyuvm star pte: %x\n", *pte);
+    // if(PRINT) cprintf("copyuvm pte: %x\n", pte);
+    // if(PRINT) cprintf("copyuvm pa: %x\n", pa);
+    // if(PRINT) cprintf("copyuvm flags: %x\n", flags);
+
+    // if((mem = kalloc()) == 0)
+    //   goto bad;
+    // memmove(mem, (char*)P2V(pa), PGSIZE);
+    uint index = pa;
+    if(!(*pte & PTE_P))
+    {
+      if(mappages_swap(d, (void*)i, PGSIZE, pa, flags) < 0) {
+        // kfree(mem);
+        goto bad;
+      }
+      index = SWAP_TO_RMAP(((pa >> 12) - SWAPSTART)/8);
     }
+    else{
+      if(mappages(d, (void*)i, PGSIZE, pa, flags) < 0) {
+            // kfree(mem);
+            goto bad;
+      }
+    }
+    
+    rmap_incref(index, p);
   }
+  // if(PRINT) cprintf("copyuvm d: %d\n", d);
+  lcr3(V2P(pgdir));
   return d;
 
-bad:
-  freevm(d);
-  return 0;
+  bad:
+    cprintf("copyuvm bad\n");
+    freevm(0, d);
+    return 0;
 }
 
 //PAGEBREAK!

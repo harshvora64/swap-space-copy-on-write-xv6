@@ -52,7 +52,7 @@ freerange(void *vstart, void *vend)
   for(; p + PGSIZE <= (char*)vend; p += PGSIZE)
   {
     kfree(p);
-    kmem.num_free_pages+=1;
+    // kmem.num_free_pages+=1;
   }
     
 }
@@ -89,6 +89,7 @@ char*
 kalloc(void)
 {
   struct run *r;
+  struct run *to_free = 0;
 
   if(kmem.use_lock)
     acquire(&kmem.lock);
@@ -101,6 +102,27 @@ kalloc(void)
     
   if(kmem.use_lock)
     release(&kmem.lock);
+
+  if(!r)
+  {
+    struct proc* p = get_victim_proc();
+    if(p == 0){
+      panic("No victim proc");
+    }
+    struct pte_va ans = get_victim_page(p);
+    pte_t* v_pg = ans.pte;
+    int va = (ans.va);
+    if(v_pg == 0)
+      panic("No victim page");
+    to_free = swap_out(p, v_pg, va);
+    
+    if(to_free == 0)
+      panic("No page to swap out");
+    kfree((char*)to_free);
+    return kalloc();
+  }
+    
+  // if(PRINT) cprintf("Kalloced the memory at %x\n", r);
   return (char*)r;
 }
 uint 

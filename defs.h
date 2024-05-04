@@ -9,6 +9,10 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct pte_va {
+  pte_t* pte;
+  int va;
+};
 
 // bio.c
 void            binit(void);
@@ -70,6 +74,26 @@ void            kfree(char*);
 void            kinit1(void*, void*);
 void            kinit2(void*, void*);
 
+// swapcow.c
+struct pte_va  get_victim_page(struct proc*);
+
+void            acquire_swaplock(void);
+void            release_swaplock(void);
+int             holdingsleep_swaplock(void);
+
+void            swapinit(void);
+struct run*     swap_out(struct proc*, pte_t*, int);
+void            swap_in(uint, struct proc*);
+void            free_swap(struct proc*);
+void            print_slots(void);
+
+void            rmap_init(void);
+uint            rmap_get_refcount(uint);
+void            rmap_incref(uint, struct proc*);
+void            rmap_decref(uint, struct proc*);
+void            pagefault_handler(uint, pde_t*);
+struct proc*    rmap_get_proc(uint, int);
+
 // kbd.c
 void            kbdintr(void);
 
@@ -122,6 +146,8 @@ int             wait(void);
 void            wakeup(void*);
 void            yield(void);
 void            print_rss(void);
+
+struct proc*    get_victim_proc(void);
 
 // swtch.S
 void            swtch(struct context**, struct context*);
@@ -178,11 +204,12 @@ void            kvmalloc(void);
 pde_t*          setupkvm(void);
 char*           uva2ka(pde_t*, char*);
 int             allocuvm(pde_t*, uint, uint);
-int             deallocuvm(pde_t*, uint, uint);
-void            freevm(pde_t*);
-void            inituvm(pde_t*, char*, uint);
+int             deallocuvm(struct proc*, pde_t*, uint, uint, int);
+void            freevm(struct proc*, pde_t*);
+void            freevm_no_rss(struct proc*, pde_t*);
+void            inituvm(pde_t*, char*, uint, struct proc*);
 int             loaduvm(pde_t*, char*, struct inode*, uint, uint);
-pde_t*          copyuvm(pde_t*, uint);
+pde_t*          copyuvm(struct proc*, pde_t*, uint);
 void            switchuvm(struct proc*);
 void            switchkvm(void);
 int             copyout(pde_t*, uint, void*, uint);

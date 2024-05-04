@@ -96,6 +96,7 @@ found:
     p->state = UNUSED;
     return 0;
   }
+  p->rss = PGSIZE;
   sp = p->kstack + KSTACKSIZE;
 
   // Leave room for trap frame.
@@ -111,7 +112,7 @@ found:
   p->context = (struct context*)sp;
   memset(p->context, 0, sizeof *p->context);
   p->context->eip = (uint)forkret;
-
+  // if(PRINT) cprintf("Allocating kstack of process id %d at page no. %x\n", myproc()->pid, V2P(p->kstack));
   return p;
 }
 
@@ -128,7 +129,7 @@ userinit(void)
   initproc = p;
   if((p->pgdir = setupkvm()) == 0)
     panic("userinit: out of memory?");
-  inituvm(p->pgdir, _binary_initcode_start, (int)_binary_initcode_size);
+  inituvm(p->pgdir, _binary_initcode_start, (int)_binary_initcode_size, p);
   p->sz = PGSIZE;
   memset(p->tf, 0, sizeof(*p->tf));
   p->tf->cs = (SEG_UCODE << 3) | DPL_USER;
@@ -163,10 +164,12 @@ growproc(int n)
 
   sz = curproc->sz;
   if(n > 0){
+    if(PRINT) cprintf("Growing proc id %d\n", myproc()->pid);
     if((sz = allocuvm(curproc->pgdir, sz, sz + n)) == 0)
       return -1;
   } else if(n < 0){
-    if((sz = deallocuvm(curproc->pgdir, sz, sz + n)) == 0)
+    if(PRINT) cprintf("Shrinking proc id %d\n", myproc()->pid);
+    if((sz = deallocuvm(curproc, curproc->pgdir, sz, sz + n, 1)) == 0)
       return -1;
   }
   curproc->sz = sz;
@@ -190,7 +193,7 @@ fork(void)
   }
 
   // Copy process state from proc.
-  if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0){
+  if((np->pgdir = copyuvm(np, curproc->pgdir, curproc->sz)) == 0){
     kfree(np->kstack);
     np->kstack = 0;
     np->state = UNUSED;
@@ -287,14 +290,16 @@ wait(void)
       if(p->state == ZOMBIE){
         // Found one.
         pid = p->pid;
+        free_swap(p);     // SWAP FUNCTIONALITY ADDED - free
         kfree(p->kstack);
         p->kstack = 0;
-        freevm(p->pgdir);
+        freevm_no_rss(p, p->pgdir);
         p->pid = 0;
         p->parent = 0;
         p->name[0] = 0;
         p->killed = 0;
         p->state = UNUSED;
+        p->rss = 0;
         release(&ptable.lock);
         return pid;
       }
@@ -546,4 +551,34 @@ procdump(void)
     }
     cprintf("\n");
   }
+}
+
+
+struct proc* get_victim_proc()
+{
+  struct proc *p = 0;
+  struct proc *victim = 0;
+  int max_rss = 0;
+  acquire(&ptable.lock);
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+  {
+    if((p->state == UNUSED))
+      continue;
+    
+    if(p->rss > max_rss)
+    {
+      max_rss = p->rss;
+      victim = p;
+    }
+    else if (p->rss == max_rss)
+    {
+      if(p->pid < victim->pid)
+      {
+        max_rss = p->rss;
+        victim = p;
+      }
+    }
+  }
+  release(&ptable.lock);
+  return victim;
 }
